@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+import os
+import re
+import sys
+import getopt
+import atexit
+import syslog
+import socket as sock
+from datetime import datetime
+import time
+from  collections import defaultdict
+
+RCODES = {
+          0 : 'SUCCESS',
+          1 : 'Format Error',
+          2 : 'Server Failure',
+          3 : 'NXDOMAIN',
+          4 : 'Not Implemented',
+          5 : 'Refused',
+          6 : 'YXDOMAIN',
+          7 : 'YXRRSET',
+          8 : 'NXRRSET',
+          9 : 'NOTAUTH',
+         10 : 'NOTZONE'
+         }
+
+OPCODE = {
+           0 : 'Query',
+           1 : 'Inverse Query',
+           2 : 'Status',
+           4 : 'Notify',
+           5 : 'Update'
+         }
+           
+# Resource record mapping
+RR_MAPPING = {
+               0 : "INVALID",
+               1 : "A",
+               2 : "NS",
+               3 : "MD",
+               4 : "MF",
+               5 : "CNAME",
+               6 : "SOA",
+               7 : "MB",
+               8 : "MG",
+               9 : "MR",
+              10 : "NULL",
+              11 : "WKS",
+              12 : "PTR",
+              13 : "HINFO",
+              14 : "MINFO",
+              15 : "MX",
+              16 : "TXT",
+              17 : "RT",
+              18 : "AFSDB",
+              19 : "X25",
+              20 : "ISDN",
+              21 : "RT",
+              22 : "NSAP",
+              23 : "NSAP_PTR",
+              24 : "SIG",
+              25 : "KEY",
+              26 : "PX",
+              27 : "GPOS",
+              28 : "AAAA",
+              29 : "LOC",
+              30 : "NXT",
+              31 : "EID",
+              32 : "SRV", 
+              33 : "ATMA",
+              34 : "NAPTR",
+              35 : "KX",
+              36 : "CERT",
+              37 : "A6",
+              38 : "DNAME",
+              39 : "SINK",
+              40 : "OPT",
+              41 : "TSIG",
+             251 : "IXFR",
+             252 : "AXFR",
+             253 : "MAILB",
+             254 : "MAILA",
+             255 : "ANY",
+             256 : "BIND-SPECIFIC",
+           } 
+
+PROGNAME = 'dns_traffic_capture'
+INPUT = defaultdict(list)
+OUTPUT = defaultdict(list) 
+OPTS = {
+         '-l' : 'LISTEN-ON',
+         '-q' : 'QUERY-SOURCE',
+         '-t' : 'TRANSFER-SOURCE',
+         '-r' : 'CAP-FILE',
+         '-o' : 'OUTPUT-FILE',
+         '-z' : 'TIME-ZONE-OFFSET',
+         '-p' : 'PACKET-DETAILS'
+       }
+# PST 
+TIME_ZONE_OFFSET = -8
+CAP_DURATION = 0
+
+CAPTURE_DURATION="tshark -r %s -n -Tfields -e frame.time"
+NO_OF_INCOMING_QUERIES="tshark -r %s -n -Y \"dns and %s.%s == %s and dns.flags.opcode == 0 and dns.flags.response == 0\""\
+                       " -Tfields -e frame.number -e frame.time -e %s.src -e udp.srcport -e %s.dst -e udp.dstport"\
+                       " -e dns.qry.name -e dns.qry.type"
+
+NO_OF_OUTGOING_RESPONSES="tshark -r %s -n -Y \"dns and %s.%s == %s and dns.flags.opcode == 0 and dns.flags.response == 1\""\
+                       " -Tfields -e frame.number -e frame.time -e %s.src -e udp.srcport -e %s.dst -e udp.dstport"\
+                       " -e dns.qry.name -e dns.qry.type -e dns.flags.rcode -e dns.time"
+
+QUERY_HEADER="\n\n||Packet No.\t||Time Stamp\t||Src P\t||Src Port\t||Dst IP\t||Dst Port\t||Query Name\t||Query Type||"
+RESPONSE_HEADER="\n\n||Packet No.\t||Time Stamp\t||Src P\t||Src Port\t||Dst IP\t||Dst Port\t||Query Name\t||Query Type\t||RCODE\t||Time||"
+def main(argv=sys.argv):
+
+    usage = "usage: %s [-l] [-q] [-t] [-o] [-z] [-p]\n"\
+            "\t-l : List of comma separated IPs defined in listen-on and listen-on-v6 statements\n"\
+            "\t-q : List of comma separated IPs defined in query-source and query-source-v6 statements\n"\
+            "\t-t : List of comma separated IPs defined in transfer-source and transfer-source-v6 statements\n"\
+            "\t-o : Full path of filename to write capture analysis\n"\
+            "\t-r : Full path of traffic capture file to analyze\n"\
+            "\t-z : Time zone offset. For example PST is 8, PDT is 9, EST is 5\n"\
+            "\t-p : Print traffic capture packet details\n"\
+
+    def _usage(msg=None):
+        if msg:
+            print '%s: %s' % (PROGNAME, msg)
+        print usage % PROGNAME
+        sys.exit(1)
+
+    def _is_valid_ipv4(addr):
+        if addr not in ('', None):
+            try:
+                sock.inet_pton(sock.AF_INET, addr)
+                return True
+            except:
+                pass
+        return False
+
+    def _is_valid_ipv6(addr):
+        if addr not in ('', None):
+            try:
+                sock.inet_pton(sock.AF_INET6, addr)
+                return True
+            except:
+                pass
+        return False
+
+    def _populate_ips(value, key):
+        for i in value.split(','):
+            if _is_valid_ipv4(i):
+                INPUT[key].append([i, 'ip'])
+            if _is_valid_ipv6(i):
+                INPUT[key].append([i, 'ipv6'])
+
+    def _convert_timestamp(tm):
+        t1 = tm.split('.')
+#        t2 = '%s.%s' %(t1[0], t1[1][0:5])
+        t2 = '%s.%s' %(re.sub('"','',t1[0]), t1[1][0:5])
+        t = datetime.strptime(t2, "%b %d, %Y %H:%M:%S.%f")
+        return t
+                               
+    def _print_capture_details(cmd, header, o_file):
+        cmd_out = os.popen(cmd)
+        line = "%s\n" %header
+        o_file.write(line)
+        for line in cmd_out.readlines():
+            a =  line.strip()
+            n = 0
+            tmp_str = '|'
+            for i in a.split('\t'):
+                if n == 1:
+                    t = _convert_timestamp(i)
+                    tmp_str = tmp_str + unicode(t) + '\t|'
+                elif n == 7:
+                    RR_TYPE = RR_MAPPING[int(i, 16)]
+                    tmp_str = tmp_str + RR_TYPE + '\t|'
+                elif n == 8:
+                    rcode = RCODES[int(i)]
+                    tmp_str = tmp_str + rcode + '\t|'
+                else:
+                    tmp_str = tmp_str + i + '\t|'
+                n = n + 1
+            tmp_str = tmp_str + '\n'
+            o_file.write(tmp_str)
+
+
+    def _do_analysis_for_incoming_queries(qry, targ_1, resp, targ_2, ip, o_file,server):
+        q_filename = 'queries_traffic-%s.txt' %ip[0]
+        qry_cmd = qry %(INPUT['CAP-FILE'][0], ip[1],targ_1,
+                  ip[0], ip[1], ip[1])
+        cmd = qry_cmd + ' > %s' %q_filename
+        print cmd
+        cmd_out = os.popen(cmd)
+        cmd_out.close()
+ 
+        r_filename = 'responses_traffic-%s.txt' %ip[0]
+        r_cmd = resp %(INPUT['CAP-FILE'][0], ip[1], targ_2,
+                  ip[0], ip[1], ip[1])
+        cmd = r_cmd + ' > %s' %r_filename
+        print cmd
+        cmd_out = os.popen(cmd)
+        cmd_out.close()
+
+        line = ''
+        l = 'Query Details for IP %s\n' %ip[0]
+        line = line + '%s\n%s\n\n'%(l, '-' * len(l))
+        o_file.write(line)
+
+        line = '\tCapture Duration :%d\n' %CAP_DURATION.seconds
+        o_file.write(line)
+
+        cmd = 'wc -l %s'  %q_filename
+        cmd_out = os.popen(cmd)
+        q = int(cmd_out.readlines()[0].strip().split(' ')[0])
+        if server == 'D':
+            line = '\tIncoming Queries :%s (%d QPS)  \n' %(q, q/CAP_DURATION.seconds)
+        else:
+            line = '\tOutgoing Queries :%s (%d QPS)  \n' %(q, q/CAP_DURATION.seconds)
+        o_file.write(line)
+        cmd_out.close()
+
+        cmd = 'wc -l %s'  %r_filename
+        cmd_out = os.popen(cmd)
+        q = int(cmd_out.readlines()[0].strip().split(' ')[0])
+        if server == 'D':
+            line = '\tResponses Sent :%s  \n' %q
+        else:
+            line = '\tResponses Received :%s  \n' %q
+        o_file.write(line)
+        cmd_out.close()
+
+        line = ''
+        if server == 'D':
+            l = "\n\nTop Incoming Queries :\n"
+        else:
+            l = "\n\nTop Outgoing Queries :\n"
+        line = line + '\t\t%s\n%s\n\n'%(l, '-' * len(l))
+        o_file.write(line)
+       
+        cmd = "cat %s | awk 'BEGIN { FS = \"\t\" }{print $7}' | sort | uniq -c | sort -n | tail -n 10" %q_filename
+        cmd_out = os.popen(cmd)
+        for line in cmd_out.readlines():
+            o_file.write(line)
+        cmd_out.close()
+
+        line = ''
+        if server == 'D':
+            l = "Top Incoming Clients :\n"
+        else:
+            l = "Top Outgoing Clients :\n"
+        line = line + '\n\n%s\n%s\n\n'%(l, '-' * len(l))
+        o_file.write(line)
+        cmd = "cat %s | awk 'BEGIN { FS = \"\t\" } {print $3}' | sort | uniq -c | sort -n | tail -n 10" %q_filename
+        cmd_out = os.popen(cmd)
+        for line in cmd_out.readlines():
+            o_file.write(line)
+        cmd_out.close()
+        # Outgoing Response RTT
+        line = ''
+        if server == 'D':
+            l = "Outgoing Responses RTT :\n"
+        else:
+            l = "Incoming Responses RTT :\n"
+        line = line + '\n\n%s\n%s\n\n'%(l, '-' * len(l))
+        o_file.write(line)
+        i = 0
+        
+        cmd = "cat %s | awk 'BEGIN { FS = \"\t\" } {print $10}' | sort -n" %r_filename
+        cmd_out = os.popen(cmd)
+        rtt_10ms = 0
+        rtt_10_100ms = 0
+        rtt_100_500ms = 0
+        rtt_500_800ms = 0
+        rtt_800_1600ms = 0
+        rtt_1600ms = 0
+        for line in cmd_out.readlines():
+            a = line.strip()
+            if a == '': 
+                continue
+            f = float(a)
+            if f < 0.01:
+                rtt_10ms+=1
+            elif f >= 0.01 and f < 0.1:
+                rtt_10_100ms+=1
+            elif f >= 0.1 and f < 0.5:
+                rtt_100_500ms+=1
+            elif f >= 0.5 and f < 0.8:
+                rtt_500_800ms+=1
+            elif f >= 0.8 and f < 1.6:
+                rtt_800_1600ms+=1
+            elif f >= 1.6:
+                rtt_1600ms+=1
+        cmd_out.close()
+        line = ''
+        line = '\t%8s queries with RTT < 10ms\n' %rtt_10ms
+        line = line + '\t%8s queries with RTT 10-100ms\n' %rtt_10_100ms
+        line = line +'\t%8s queries with RTT 100-500ms\n' %rtt_100_500ms
+        line = line + '\t%8s queries with RTT 500-800ms\n' %rtt_500_800ms
+        line = line + '\t%8s queries with RTT 800-1600ms\n' %rtt_800_1600ms
+        line = line + '\t%8s queries with RTT > 1600ms\n' %rtt_1600ms
+        o_file.write(line)  
+        line = ''
+        l = "Query Return Codes :\n"
+        line = line + '\n\n%s\n%s\n\n'%(l, '-' * len(l))
+        o_file.write(line)
+        i = 0
+        cmd = "cat %s | awk 'BEGIN { FS = \"\t\" } {print $9}' | sort -n | uniq -c | sort -n" %r_filename
+        cmd_out = os.popen(cmd)
+        for line in cmd_out.readlines():
+            a = line.strip().split(' ')
+            if len(a) >=2 and len(a[0]) > 0 and len(a[1]) > 0:
+                l = '%20s : %8s \n' %(RCODES[int(a[1])], a[0])
+                o_file.write(l)
+        cmd_out.close()
+        if 'PACKET-DETAILS' in INPUT and INPUT['PACKET-DETAILS']:
+            # Print the incoming query traffic to output file
+            cmd = 'cat %s' %q_filename
+            _print_capture_details(cmd, QUERY_HEADER, o_file)
+
+            # Print the outgoing responses traffic to output file
+            cmd = 'cat %s' %r_filename
+            _print_capture_details(cmd, RESPONSE_HEADER, o_file)
+        # Delete the files created by tshark
+        cmd = 'rm -rf %s' %q_filename
+        cmd_out = os.popen(cmd)
+        cmd_out.close()
+
+        cmd = 'rm -rf %s' %r_filename
+        cmd_out = os.popen(cmd)
+        cmd_out.close()
+
+    try:
+        opts, args = getopt.getopt(argv[1:], 'pl:q:t:r:o:z:')
+        if args:
+            _usage('argument unexpected')
+        for opt, value in opts:
+             if opt in ('-l', '-q','-t'):
+                 _populate_ips(value, OPTS[opt])
+             elif opt == '-p':
+                 INPUT[OPTS[opt]].append(True)
+             else:
+                 INPUT[OPTS[opt]].append(value)                 
+    except getopt.error, msg:
+        _usage(msg)
+
+    # Open the output file
+    if INPUT['OUTPUT-FILE'][0] is not None:
+        OUT_FILE = open(INPUT['OUTPUT-FILE'][0], 'w')
+
+    # Determine capture duration
+    cmd = CAPTURE_DURATION %INPUT['CAP-FILE'][0]
+    cmd1 = cmd + '> cap.txt'
+    cmd_out = os.popen(cmd1)
+    cmd_out.close()
+
+    cmd = 'head -n 1 cap.txt'
+    cmd_out = os.popen(cmd)
+    start_time = _convert_timestamp(cmd_out.readlines()[0].strip())
+    cmd_out.close()
+    
+    cmd = 'tail -n 1 cap.txt'
+    cmd_out = os.popen(cmd)
+    end_time = _convert_timestamp(cmd_out.readlines()[0].strip())
+    cmd_out.close()
+    CAP_DURATION = end_time - start_time
+
+    cmd_out = os.popen('rm -rf cap.txt')
+    cmd_out.close()
+    # Analyze all the incoming queries and print their stats
+    line = ''
+    l = 'Incoming traffic details'
+    line = line + '\t\t\t\t%s\n\t\t\t\t%s\n\n' %(l, '-' * len(l))
+    OUT_FILE.write(line)
+    for listen in INPUT['LISTEN-ON']:
+        _do_analysis_for_incoming_queries(NO_OF_INCOMING_QUERIES, 'dst',
+                                          NO_OF_OUTGOING_RESPONSES, 'src',
+                                          listen, OUT_FILE, 'D') 
+    line = ''
+    l = 'Upstream traffic details'
+    line = line + '\n\n\n\t\t\t\t%s\n\t\t\t\t%s\n\n\n' %(l, '-' * len(l))
+    OUT_FILE.write(line)
+    for listen in INPUT['QUERY-SOURCE']:
+        _do_analysis_for_incoming_queries(NO_OF_INCOMING_QUERIES, 'src',
+                                          NO_OF_OUTGOING_RESPONSES, 'dst',
+                                          listen, OUT_FILE, 'U') 
+if __name__ == '__main__':
+    sys.exit(main())
+

@@ -1,0 +1,639 @@
+#!/usr/bin/python3
+# Author: Jabesh MR, jrajan@infoblox.com
+# Automates DB restore
+# Basic usage                        : <script name> <backup file> <lab grid IP>
+# For non-default credentials on lab : <script name> <backup file> <lab grid IP> <lab grid username>
+# including custom password          : <script name> <backup file> <lab grid IP> <lab grid username> <lab grid password>
+#
+#-------------------------------------------------------------------------------
+
+import sys
+import os
+import ipaddress
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+import re
+import tarfile
+import tempfile
+import time
+import json
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+source_dir = os.getcwd()
+tdir = tempfile.TemporaryDirectory()
+temp_dir = tdir.name
+
+def show_help(): #help fn
+    script_name = re.sub(r'.*/','',sys.argv[0])
+    print('Automated DB restore\n--------------------\n\
+                        Basic usage : ' + script_name +' <backup file/path> <lab grid IP>\n\
+    For non-default username in lab : ' + script_name + ' <backup file/path> <lab grid IP> <lab grid username>\n\
+          with non-default password : ' + script_name + ' <backup file/path> <lab grid IP> <lab grid username> <lab grid password>');
+def log(l,SameLine=False):
+    ''' Log something to screen, add timestamp if new line '''
+    prepend = '' if SameLine else '\n' + time.strftime("%H:%M:%S", time.localtime()) + ':'
+    print(prepend, l, end = '')
+    sys.stdout.flush()
+    return
+def napi(ip,username,password,method='GET',object_and_fn='?_schema',data={},wapi_version='v2.7.1'):
+    ''' Sends WAPI call to NIOS, returns status code and a list of response '''
+    session = requests.Session()
+    session.auth = (username,password)
+    session.verify = False
+    session.headers = {"Content-Type": "application/json"}
+    url = 'https://' + ip + '/wapi/' + wapi_version + '/' + object_and_fn
+    s_code = -1
+    resp = []
+    if method not in ['GET','PUT','POST','DELETE']:
+        log(method + ' method not supported in NIOS')
+        sys.exit()
+    try:
+        r = session.request(method, url, json=data)
+    except requests.exceptions.ConnectionError:
+        log('WAPI connection failed to ' + ip)
+        sys.exit()
+    s_code = r.status_code
+    if s_code >= 400:
+        log('Got code:' + str(s_code) + ' for API: ' + url + ' ' + str(data))
+        if s_code == 401: 
+            log('Check credentials')
+            print('\n',r.text)
+        sys.exit()
+    else:
+        out = r.json()
+        resp.extend(out) if isinstance(out, list) else resp.append(out)
+    return s_code, resp
+def check_ip_type(ip): #IP type checker
+    ''' Returns 'v4' if given string is a valid IPv4 address
+        Returns 'v6' if given string is a valid IPv6 IP Address
+        Returns 'invalid' if invalid IP '''
+    result = 'invalid'
+    try:
+        t = ipaddress.ip_address(ip)
+        if isinstance(t,ipaddress.IPv4Address):
+            if ip != '0.0.0.0' and ip !='255.255.255.255': result = 'v4'
+        if isinstance(t,ipaddress.IPv6Address):
+            if t != ipaddress.IPv6Address('::'): result ='v6'
+    except ValueError:
+        pass
+    return result
+def onedb(f): 
+    ''' Reads onedb.xml file and returns objects as a struct (removes PARTITION-MAP and __key if present)
+        For <DATABASE blahblahblah> -> {'__type':'db_line' , 'nios_ver'='x.x.x-xxxx' ,'int_ver':'x.x.x-xxx' , '__txt':'full line as text'}
+        For <OBJECT> ... </OBJECT> -> {'__type':'whatever type' , 'name':'value' , 'name':'value' , ... , '__txt':'<OBJECT> ... </OBJECT>'} 
+        For </DATABASE> -> {'__type':'end_line' , '__txt':'</DATABASE>'} '''
+    onedb_xml = open(f,'r')
+    buff = onedb_xml.read(1024)
+    # Need a regex to match unwanted \n and whitespaces to normalize objects
+    # This is for onedb.xml files that have object spanning multiple lines
+    reg = '^[\n ]+|[\n ]+$|(?<=>)[\n ]+(?=<PROPERTY NAME)|(?<=>)[\n ]+(?=</OBJECT)|(?<=>)[\n ]+(?=<PARTITION-MAP)'
+    delimiter = '>'  # extracting the first line which starts with <DATABASE ... clip at >
+    while buff:
+        items = buff.split(delimiter,1)
+        if len(items)==2:
+            obj_txt = items.pop(0) + delimiter
+            obj_txt = re.sub(reg,'',obj_txt)
+            obj = {}
+            obj['__type'] = 'db_line'
+            obj['nios_ver'] = re.search(' VERSION=\"([^\"]+)',obj_txt).group(1)
+            obj['int_ver'] = re.search(' INT-VERSION=\"([^\"]+)',obj_txt).group(1)
+            obj['__txt'] = obj_txt
+            yield obj
+            buff = items.pop(0)
+            break
+        else:
+            buff = buff + onedb_xml.read(4096)
+    delimiter = '</OBJECT>' # next we get each object cliping at </OBJECT>
+    while buff:
+        items = buff.split(delimiter,1)
+        if len(items)==2:
+            obj_txt = items.pop(0) + delimiter
+            obj_txt = re.sub(reg,'',obj_txt)
+            buff = items.pop(0)
+            if buff == '': buff = onedb_xml.read(8192)
+            obj = {}
+            line = re.sub('<OBJECT>|</OBJECT>|<PARTITION-MAP VALUE="[^\"]*"/>|<PROPERTY NAME="__key" VALUE="[^\"]*"/>','',obj_txt)
+            for name,value in re.findall('<PROPERTY NAME=\"([^\"]+)\" VALUE=\"([^\"]*)\"/>',line):
+                obj[name] = value
+            line = re.sub('<PROPERTY NAME=\"([^\"]+)\" VALUE=\"([^\"]*)\"/>','',line)
+            if line: log('Failed to extract all from object, did not capture: '+ line)
+            obj['__txt'] = obj_txt
+            yield obj
+        elif len(items) == 1:
+            if items[0].replace('\n','') == '</DATABASE>':   # if reached end of onedb, then we see this
+                obj = {}
+                obj['__type'] = 'end_line'
+                obj['__txt'] = '</DATABASE>'
+                yield obj
+                break
+            else: buff = buff + onedb_xml.read(8192)
+    onedb_xml.close()
+def process_onedb(fi,fo):
+    ''' Takes a onedb.xml file in (fi) extracts important details
+        writes a onedb.xml file out(fo) after changing things like admin password, auth policy order, etc
+        Returns grid_details(includes GM details), a list of member details and a dict of changes made '''
+    grid_details = {} # holds grid level config details and GM config details
+    modification = {} # holds the important changes made
+    grid_details['db_timestamp'] = time.ctime(os.path.getmtime(fi))
+    # some counters and variables to store details
+    gm_vnode_id = -1
+    pnodes = [] # list of all pnode IDs
+    vnodes = [] # list of all vnode IDs
+    vnode_pnode_map = {} # list of Pnodes mapped to a vnode (ie, HA should have 2 pnodes, SA should have 1 pnode but still in list) eg : { 0:[0], 1[1,2], 2:[3]}
+    member_type = {}    # Mapped to Vnode IDs
+    hostname = {}   # Mapped to Vnode IDs
+    config_addr_type = {}   # BOTH/IPV4/IPV6 mapped to Vnode IDs
+    v4_vip = {}     # mapped to Vnode IDs, absent if no v4 on VIP/LAN1
+    v6_vip = {}     # mapped to Vnode IDs, absent if no v6 on VIP/LAN1
+    v4_mgmt = {}    # mapped to Pnode IDs, Pnode absent if no v4 on mgmt
+    v6_mgmt = {}    # mapped to Pnode IDs, Pnode absent if no v6 on mgmt
+    ha = {} # mapped to Vnode IDs
+    nat_enabled = {}    # mapped to Vnode IDs
+    potential_master = {}   # mapped to Vnode IDs
+    nic_failover_enabled = {}   # port redundancy
+    nic_failover_enable_primary = {}    # port redundancy - prefer LAN1
+    default_route_failover_enabled  ={} # LAN1 LAN2 default route failover
+    override_remote_console_access = {} # member ssh setting overriden?
+    remote_console_access_enabled = {}  # member ssh enabled?
+    create_admin = create_group_link = True
+    superuser_groups = []   # all superuser groups
+    admin_group_mapping = {}    # admin:admin-group dict, has all mappings
+    pnode_licenses = {}   # list of license names mapped to Pnode IDs, includes deleted and expired
+    grid_wide_licenses = [] # list of grid wide licenses, includes deleted and expired
+    # Need to go through the DB once to gather details required to decide what to change
+    for obj in onedb(fi):
+        obj_type = obj['__type'].replace('.com.infoblox.one.','')
+        if obj_type == 'admin' and obj['name'] == 'admin':
+            create_admin = False
+            create_group_link = False
+        elif obj_type == 'admin_group':
+            if obj['superuser'] == 'true' and obj['name'] != 'cloud-api-superuser':
+                superuser_groups.append(obj['name'])
+        elif obj_type == 'admin_group_link':
+            admin_group_mapping[obj['admin']] = obj['admin_group']
+        elif obj_type == 'admin_auth_method':
+            if obj['position'] == '0': first_auth_method = obj['auth_method_name']
+            if obj['auth_method_name'] == 'Local Admin': local_auth_method_position = obj['position']
+        elif obj_type == 'virtual_node':
+            vnode_id = obj['virtual_oid']
+            vnodes.append(vnode_id)
+            member_type[vnode_id] = obj['member_type']
+            config_addr_type[vnode_id] = obj['config_addr_type']
+            if config_addr_type[vnode_id] != 'IPV6': v4_vip[vnode_id] = obj['virtual_ip']
+            if config_addr_type[vnode_id] != 'IPV4': v6_vip[vnode_id] = obj['v6_virtual_ip']
+            if obj['is_master'] == 'true': gm_vnode_id = vnode_id
+            ha[vnode_id] = obj['ha_enabled']
+            hostname[vnode_id] = obj['host_name']
+            nat_enabled[vnode_id] = obj['nat_enabled']
+            potential_master[vnode_id] = obj['is_potential_master']
+            nic_failover_enabled[vnode_id] = obj['nic_failover_enabled']
+            nic_failover_enable_primary[vnode_id] = obj['nic_failover_enable_primary']
+            override_remote_console_access[vnode_id] = obj['override_remote_console_access']
+            remote_console_access_enabled[vnode_id] = obj['remote_console_access_enabled']
+            if 'default_route_failover_enabled' in obj: default_route_failover_enabled[vnode_id] = obj['default_route_failover_enabled']
+        elif obj_type == 'physical_node':
+            pnode_id = obj['physical_oid']
+            pnodes.append(pnode_id)
+            vnode_id = obj['virtual_node']
+            vnode_pnode_map.setdefault(vnode_id, []).append(pnode_id)
+            if obj['mgmt_port_enabled'] == 'true': 
+                if 'mgmt_port_address' in obj: v4_mgmt[pnode_id] = obj['mgmt_port_address']
+                if 'v6_mgmt_port_address' in obj: v6_mgmt[pnode_id] = obj['v6_mgmt_port_address']
+        elif obj_type == 'product_license':
+            pnode_id = obj['pnode']
+            pnode_licenses.setdefault(pnode_id, []).append(obj['license_type'])
+        elif obj_type == 'license_grid_wide':
+            grid_wide_licenses.append(obj['license_type'])
+    # We collected all details to decide what to change
+    selected_admin_group = 'admin-group' if 'admin-group' in superuser_groups else superuser_groups[0]  # select a superuser group, prefer 'admin-group'
+    # Open output file and start writing while making required changes. We also collect so useful info and details on what is being changed    
+    o = open(fo,'w')
+    for obj in onedb(fi):
+        obj_type = obj['__type'].replace('.com.infoblox.one.','')
+        if obj_type == 'admin':
+            if create_admin:
+                line = '<OBJECT><PROPERTY NAME="__type" VALUE=".com.infoblox.one.admin"/><PROPERTY NAME="name" VALUE="admin"/><PROPERTY NAME="password" VALUE="123@BLOXlab"/></OBJECT>\n'
+                o.write(line)
+                create_admin = False
+                modification['admin'] = 'Account not found, created one'
+            if obj['name'] == 'admin': # What if admin account is present but not local?? need to test and then expand this to include that
+                if 'enable_certificate_authentication' in obj and obj['enable_certificate_authentication'] == 'true':
+                    modification['admin_cert_auth'] = 'Changed from "' + obj['enable_certificate_authentication'] + '" to "false"'
+                    obj['enable_certificate_authentication'] = 'false'
+                if obj['disabled'] == 'true':
+                    modification['admin_disabled'] = 'Chagned from "' + obj['disabled'] + '" to "false"'
+                    obj['disabled'] = 'false'
+                if 'status' in obj and obj['status'] != 'ACTIVE': 
+                    modification['admin_status'] = 'Changed from "' + obj['status'] + '" to "ACTIVE"'
+                    obj['status'] = 'ACTIVE'
+                if 'auth_type' in obj and obj['auth_type'] != 'LOCAL':
+                    modification['admin_auth_type'] == 'Changed from "' + obj['auth_type'] + '" to "LOCAL"'
+                obj['password'] = '123@BLOXlab'
+                modification['admin'] = 'Password changed'
+        elif obj_type == 'admin_group' and obj['name'] == selected_admin_group:
+            if obj['disabled'] == 'true':
+                modification['admin_group'] = '"' + selected_admin_group + '" was disabled, enabled it'
+                obj['disabled'] = 'false'
+            if obj['enable_restricted_user_access'] == 'true':
+                modification['admin_group_acl'] = '"' + selected_admin_group + '" had ACL set up, disabled it'
+                obj['enable_restricted_user_access'] = 'false'
+        elif obj_type == 'admin_group_link':
+            if create_group_link:
+                modification['admin_group_link'] = 'Linked the created "admin" account to "' + selected_admin_group + '" group'
+                line = '<OBJECT><PROPERTY NAME="__type" VALUE=".com.infoblox.one.admin_group_link"/><PROPERTY NAME="admin_group" VALUE=".'+ selected_admin_group +'"/><PROPERTY NAME="admin" VALUE="admin"/></OBJECT>'
+                o.write(line)
+                create_group_link = False
+            if obj['admin'] == 'admin':
+                if obj['admin_group'] != '.' + selected_admin_group:
+                    modification['admin_group_link'] = '"admin" account is linked to "' + obj['admin_group'] + '" group, changed it to "' + selected_admin_group + '"'
+                    obj['admin_group'] = '.' + selected_admin_group
+        elif obj_type == 'admin_auth_method':
+            if obj['auth_method_name'] == 'Local Admin': 
+                modification['authentication_policy'] = '"Local Admin" is at position ' + obj['position']
+                if local_auth_method_position == '0':
+                    modification['authentication_policy'] += ' - no change'
+                else: 
+                    obj['position'] = '0'
+                    modification['authentication_policy'] += ' and "' + first_auth_method + '" is at position 0 - Swapped their positions'
+            if obj['auth_method_name'] == first_auth_method and first_auth_method != 'Local Admin': 
+                obj['position'] = local_auth_method_position
+        elif obj_type == 'cluster_security':
+            grid_details['session_timeout'] = obj['session_timeout']
+            grid_details['ssh'] = obj['remote_console_access_enabled']
+            grid_details['ssh_perm_disabled'] = obj['ssh_perm_disabled']
+            grid_details['acl_apply_to_ssh'] = obj['security_remote_console_enabled']
+            grid_details['access_acl'] = obj['security_enabled']
+            if obj['security_enabled'] == 'true':
+                modification['grid_access_ACL'] = 'Changed from "' + obj['security_enabled'] + '" to "false"'
+                obj['security_enabled'] = 'false'
+            if obj['session_timeout'] != '86400':
+                modification['session_timeout'] = 'Changed from "' + obj['session_timeout'] + '" to "86400"(24 hours)'
+                obj['session_timeout'] = '86400'
+        elif obj_type == 'cluster':
+            grid_details['grid_name'] = obj['name']
+            grid_details['shared_secret'] = obj['shared_secret']
+            grid_details['gui_on_lan_and_mgmt'] = obj['enable_gui_api_for_lan_vip']
+            if vnode_pnode_map[gm_vnode_id][0] in v4_mgmt or vnode_pnode_map[gm_vnode_id][0] in v6_mgmt:
+                if obj['enable_gui_api_for_lan_vip'] == 'false':
+                    modification['gui_access_on_vip_and_mgmt'] = 'Changed from "' + obj['enable_gui_api_for_lan_vip'] + '" to "true" since GM has MGMT interface enabled'
+                    obj['enable_gui_api_for_lan_vip'] = 'true'
+            #obj['shared_secret'] = '123@BLOXlab'
+            modification['grid_and_member_email'] = 'Email and relay disabled'
+        elif obj_type == 'cluster_email' or obj_type == 'vnode_email':
+            obj['email_notify'] = 'false'
+            obj['specify_email_relay'] = 'false'
+        # Write to DB    
+        if obj['__type'] == 'db_line' or obj['__type'] == 'end_line': 
+            if obj['__type'] == 'db_line': grid_details['nios_ver'] = obj['nios_ver']
+            o.write(obj['__txt'] + '\n')
+            continue
+        line = '<OBJECT>'
+        for key in obj:
+            if key != '__txt': line += '<PROPERTY NAME="' + key + '" VALUE="' + obj[key] + '"/>'
+        line += '</OBJECT>\n'
+        o.write(line)
+    o.close()
+    # Make a record of member details we collected, will be useful at some point
+    member_details = []
+    for vnode in vnodes:
+        member = {}
+        member['vnode_id'] = vnode
+        member['pnode_ids'] = vnode_pnode_map[vnode]
+        member['hostname'] = hostname[vnode]
+        member['type'] = member_type[vnode]
+        member['ha'] = ha[vnode]
+        member['nw_type'] = config_addr_type[vnode]
+        member['vip4'] = '' if vnode not in v4_vip else v4_vip[vnode]
+        member['vip6'] = '' if vnode not in v6_vip else v6_vip[vnode]
+        member['mgmt'] = []
+        member['licenses'] = []
+        for pnode in vnode_pnode_map[vnode]:
+            if pnode in v4_mgmt: member['mgmt'].append(v4_mgmt[pnode])
+            if pnode in v6_mgmt: member['mgmt'].append(v6_mgmt[pnode])
+            if pnode in pnode_licenses:
+                for lic in pnode_licenses[pnode]:
+                    if lic not in member['licenses']: member['licenses'].append(lic)
+        member['gmc'] = potential_master[vnode]
+        member['nat'] = nat_enabled[vnode]
+        member['port_redundancy'] = nic_failover_enabled[vnode]
+        member['port_redundancy_prefer_lan1'] = nic_failover_enable_primary[vnode]
+        member['ssh'] = remote_console_access_enabled[vnode] if override_remote_console_access[vnode] == 'true' else grid_details['ssh']
+        member['default_route_failover'] = 'false' if vnode not in default_route_failover_enabled else default_route_failover_enabled[vnode]
+        if vnode == gm_vnode_id: grid_details['gm'] = member
+        else: member_details.append(member) 
+    return grid_details, member_details, modification
+def check_and_extract_backup(backup,dir,extract=True): #Fn to extract DB.tar.gz to directory
+    ''' Extracts backup to directory and/or verify integrity
+        Returns True if all went well, False if something went wrong '''
+    try: f = tarfile.open(backup)
+    except:
+        log('Error opening file: ' + backup)
+        return False
+    try: items = f.getmembers()
+    except:
+        log('Integrity check failed: ' + backup)
+        return False
+    if extract == True:
+        try:
+            for item in items:
+                item.path = item.path.split('/',1)[-1]
+            x = f.extractall(path = dir, members = items)
+        except:
+            log('Backup extraction failed: ' + backup + ' to: ' + dir)
+            print(x.raise_for_status())
+            return False
+    f.close()
+    return True
+def create_backup(source_dir,backup_dir):
+    ''' Creates backup file using all files and directories in source_dir
+        Returns created backup file path '''
+    if not os.path.isdir(source_dir):
+        print('Cannot create backup, source_dir is invalid')
+        sys.exit()
+    content = os.listdir(source_dir)
+    if not content:
+        print('Cannot create backup, source_dir is empty')
+    backup_file = os.path.normpath(os.path.join(backup_dir,'created_backup.tar.gz'))
+    f = tarfile.open(backup_file,'x:gz')
+    for thing in content:
+        thing_path = os.path.normpath(os.path.join(source_dir,thing))
+        if os.path.isfile(thing_path): name = thing_path.replace(source_dir,'')
+        elif os.path.isdir(thing_path): name = thing_path.replace(source_dir,'/') # it does not add / to the begining, but same as dbcvt and that seems to work fine
+        f.add(thing_path,name)
+    f.close()
+    return backup_file
+def wait_nios(ip,username,password,extra_wait_after_up=False,timeout=1800,retry_interval=60): #Waits for NIOS to come back up
+    ''' Waits for GM at ip to be able to respond to WAPI
+        Returns True if GM responded before timeout
+        Returns False if timeout exceeded '''
+    session = requests.Session()    # Does not use napi() as timeout exception is expected and handled differently
+    session.auth = (username,password)
+    session.verify = False
+    session.headers = {"Content-Type": "application/json"}
+    wapi_version = 'v2.7.1'
+    object_and_fn ='search?_schema'
+    url = 'https://' + ip + '/wapi/' + wapi_version + '/' + object_and_fn
+    data = ''
+    t = out = ''
+    result = False
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        try:
+            log('Checking WAPI on ' + ip + ' ...')
+            t = session.get(url, params = data)
+            if t.status_code >= 400:
+                log('Got code:' + str(t.status_code) + ' for API: ' + url + ' ' + str(data))
+                if t.status_code == 401: 
+                    log('Check credentials')
+                    print('\n',t.text)
+                sys.exit()
+            out = t.json()
+            if 'version' in out:
+                log('Its Up',True)
+                result = True
+                break
+        except requests.exceptions.ConnectionError: 
+            log('Failed',True)
+            if time.time() < end_time-retry_interval: log(', will try again after ' + str(retry_interval) + ' seconds',True)
+            time.sleep(retry_interval)
+    if extra_wait_after_up and result: time.sleep(60)
+    return result
+def get_lab_gm_details(ip,username,password):
+    ''' Returns details of lab GM 
+        'hostname': <gm_fqdn>, 
+        'nios_ver': <full NIOS version>, 
+        'is_ha': True/False, 
+        'nw_type': IPV4 | IPV6 | BOTH '''
+    gm_details = {}
+    object_and_fn ='upgradestatus'
+    data = {"type":"VNODE"}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    member_details = r   # this is a list, need to identify GM
+    for member in member_details:
+        if member['upgrade_group'] == 'Grid Master': # gm will always be in this and the group cannot be renamed
+            gm_details['nios_ver'] = member['current_version']
+            gm_details['hostname'] = member['member']
+            gm_details['is_ha'] = False if member['ha_status'] == "NOT_CONFIGURED" else True
+            if 'ipv6_address' in member and 'ipv4_address' in member: gm_details['nw_type'] = 'BOTH'
+            elif 'ipv6_address' not in member: gm_details['nw_type'] = 'IPV4'
+            elif 'ipv4_address' not in member: gm_details['nw_type'] = 'IPV6'
+    object_and_fn ='grid?_return_fields=security_setting'
+    data = {}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    gm_details['timeout'] = r[0]['security_setting']['session_timeout']
+    return gm_details
+def lab_gm_change_name(ip,username,password,hostname,newname):
+    ''' Change hostname of GM to that from DB '''
+    if hostname == newname: log('Current name and new name are same, no need to change hostname'); return False
+    object_and_fn ='member'
+    data = {"host_name":hostname}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    object_and_fn = r[0]['_ref']
+    data = {"host_name":newname}
+    c,r = napi(ip,username,password,'PUT',object_and_fn,data)
+    return True if c == 200 else False
+def _lab_gm_add_v4_addr(ip,username,password,hostname):
+    ''' Adds IPv4 address to LAN1 on lab GM '''
+    object_and_fn ='member'
+    data = {"host_name":hostname}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    if r[0]['config_addr_type'] != 'IPV6': log('GM already has IPv4 address on LAN1\n'); sys.exit()
+    object_and_fn = r[0]['_ref']
+    last_octet = int(ip.replace('[','').replace(']','')[-2:].replace(':',''), 16)
+    if last_octet in [0,1,255]: last_octet = 50 + int((time.time()%1)*(250-50))
+    ip4='192.168.50.' + str(last_octet)
+    data = {"config_addr_type":"BOTH", "vip_setting":{"subnet_mask":"255.255.255.0", "gateway":"192.168.50.1", "address": ip4}}
+    c,r = napi(ip,username,password,'PUT',object_and_fn,data)
+    return True
+def _lab_gm_add_v6_addr(ip,username,password,hostname):
+    ''' Adds IPv6 address to LAN1 on lab GM '''
+    object_and_fn ='member'
+    data = {"host_name":hostname}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    if r[0]['config_addr_type'] != 'IPV4': log('GM already has IPv6 address on LAN1\n'); sys.exit()
+    object_and_fn = r[0]['_ref']
+    ip6='1011::' + ip.split('.')[3]
+    data = {"config_addr_type":"BOTH", "ipv6_setting":{"auto_router_config_enabled":False, "cidr_prefix": 64, "enabled":True, "gateway": "1011::1000", "virtual_ip": ip6}}
+    c,r = napi(ip,username,password,'PUT',object_and_fn,data)
+    return True
+def _lab_gm_remove_v6_addr(ip,username,password,hostname):
+    ''' Removes IPv6 address from LAN1 on lab GM '''
+    object_and_fn ='member?_return_fields=config_addr_type,vip_setting,ipv6_setting'
+    data = {"host_name":hostname}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    if r[0]['config_addr_type'] != 'BOTH': log('GM does not have v4 address on LAN1 to remove\n'); sys.exit()
+    ip_type = 'v6' if ':' in ip else 'v4'
+    if ipaddress.ip_address(ip.replace('[','').replace(']','')) == ipaddress.ip_address(r[0]['ipv6_setting']['virtual_ip']):
+        log('Currently using IPv6 to contact GM, switching to IPv4: ' + r[0]['vip_setting']['address'])
+        ip=r[0]['vip_setting']['address']
+        ip_type = 'v4'
+    object_and_fn = r[0]['_ref']
+    data = {"config_addr_type":"IPV4"}
+    c,r = napi(ip,username,password,'PUT',object_and_fn,data)
+    return ip_type,ip
+def _lab_gm_remove_v4_addr(ip,username,password,hostname):
+    ''' Removes IPv4 address from LAN1 on lab GM '''
+    object_and_fn ='member?_return_fields=config_addr_type,vip_setting,ipv6_setting'
+    data = {"host_name":hostname}
+    c,r = napi(ip,username,password,'GET',object_and_fn,data)
+    if r[0]['config_addr_type'] != 'BOTH': log('GM does not have v4 address on LAN1 to remove\n'); sys.exit()
+    ip_type = 'v6' if ':' in ip else 'v4'
+    if ip == r[0]['vip_setting']['address']:
+        log('Currently using IPv4 to contact GM, switching to IPv6: ' + r[0]['ipv6_setting']['virtual_ip'])
+        ip='[' + r[0]['ipv6_setting']['virtual_ip'] + ']'
+        ip_type = 'v6'
+    object_and_fn = r[0]['_ref']
+    data = {"config_addr_type":"IPV6"}
+    c,r = napi(ip,username,password,'PUT',object_and_fn,data)
+    return ip_type,ip
+def lab_adjust_network(gm_details,db_details,ip,username,password):
+    ip_type = 'v6' if ':' in ip else 'v4'
+    if db_details['nw_type'] == 'BOTH':
+        if gm_details['nw_type'] == 'IPV4':
+            log('Adding IPv6 to lab GM LAN1 config ...')
+            c = _lab_gm_add_v6_addr(ip,username,password,gm_details['hostname'])
+            log('Done',True)
+        if gm_details['nw_type'] == 'IPV6':
+            log('Adding IPv4 to lab GM LAN1 config ...')
+            c = _lab_gm_add_v4_addr(ip,username,password,gm_details['hostname'])
+            log('Done',True)
+    if db_details['nw_type'] == 'IPV4':
+        if gm_details['nw_type'] == 'BOTH':
+            log('Removing IPv6 from lab GM LAN1 config ...')
+            ip_type, ip = _lab_gm_remove_v6_addr(ip,username,password,gm_details['hostname'])
+            log('Done',True)
+        if gm_details['nw_type'] == 'IPV6':
+            log('Cannot proceed, set IPv4 on interface manually and try again')
+            sys.exit()
+    if db_details['nw_type'] == 'IPV6':
+        if gm_details['nw_type'] == 'IPV4':
+            log('Cannot proceed, set IPv6 on interface manually and try again')
+            sys.exit()
+        if gm_details['nw_type'] == 'BOTH':
+            log('Removing IPv4 from lab GM LAN1 config ...')
+            ip_type, ip = _lab_gm_remove_v4_addr(ip,username,password,gm_details['hostname'])
+            log('Done',True)
+    log('Waiting 60 seconds for product restart ...')
+    time.sleep(60)
+    wait_nios(ip,username,password,False,600)
+    return ip_type, ip
+def restore_db(backup_file,ip,username,password): #Main DB restore function
+    session = requests.Session()
+    session.auth = (username,password)
+    session.verify = False
+    wapi_version = 'v2.7.1'
+
+    gm_http = 'https://%s/wapi/%s/'%(ip,wapi_version)
+    #upload initialise (uploadinit)
+    object_and_fn ='fileop?_function=uploadinit'
+    log('Sending uploadinit ...')
+    try:
+        r = session.post(gm_http + object_and_fn)
+    except:
+        log('Uploadinit call failed',True)
+        print(r.raise_for_status())
+        sys.exit()
+    log('Done',True)
+    upload_param = r.json() # gets upload_param['url'] and upload_param['token']
+
+    #upload the backup file
+    files = {'media': open(backup_file, 'rb')}
+    log('Uploading backup file ...')
+    try:
+        r = session.post(upload_param['url'], files=files, verify=False)
+    except:
+        log('Backup upload failed',True)
+        print(r.raise_for_status())
+        sys.exit()
+    log('Done',True)
+
+    #set backup parameters
+    object_and_fn = 'fileop?_function=restoredatabase'
+    data = '{ "token":"' + upload_param['token'] +'" , "mode":"FORCED" , "keep_grid_ip":true , "nios_data":true }'
+    #trigger DB restore
+    log('Restoring DB ...')
+    try:
+        r = session.post(gm_http + object_and_fn, data.replace("\n","\\n"), headers={"Content-Type": "application/json"})
+    except:
+        log('Connection timed out or no response (DB restore may take a long time, check the GM logs for progress). ',True)
+        #print(r.raise_for_status())
+        #sys.exit()
+    log('Done',True)
+    return
+
+# process inputs <script> db_backup_file_path lab_gm_ip [lab_username] [lab_password]
+arg_count = len(sys.argv)
+if arg_count<=2: show_help(); sys.exit()
+if arg_count>=6: log('Error: Too many arguments, what to do with all this?'); show_help(); sys.exit()
+
+backup_file = sys.argv[1]
+lab_gm_ip = sys.argv[2]
+log('Backup file = ' + backup_file)
+log('Lab GM IP = ' + lab_gm_ip)
+lab_username = 'admin' if arg_count<=3 else sys.argv[3]
+log('Lab username = ' + lab_username)
+lab_password = 'infoblox' if arg_count<=4 else sys.argv[4]
+log('Lab password = ' + lab_password)
+lab_gm_ip_type = check_ip_type(lab_gm_ip)
+if lab_gm_ip_type == 'invalid': log('Lab GM IP is not valid: ' + lab_gm_ip); sys.exit()
+if lab_gm_ip_type == 'v6': lab_gm_ip = '[' + lab_gm_ip + ']'  #for IPv6 address, the URL should have it in square brackets []
+# Finished processing inputs---
+
+log('Checking backup file ...')
+e = check_and_extract_backup(backup_file,temp_dir)
+if not e: log('Backup file extract/verification failed!',True); sys.exit()
+log('Done',True)
+orig = os.path.normpath(os.path.join(temp_dir,'onedb_original.xml'))
+odb = os.path.normpath(os.path.join(temp_dir,'onedb.xml'))
+os.rename(odb,orig)
+log('Processing DB file ...')
+db_grid_details,db_member_details,db_modifications = process_onedb(orig,odb)
+log('Done',True)
+os.remove(orig)
+log('Repacking backup file ...')
+backup_file = create_backup(temp_dir,temp_dir)
+log('Done',True)
+#db_gm_details = get_db_gm_details(odb)
+db_gm_details = db_grid_details['gm']
+
+log('Details from the DB:\n')
+print( json.dumps(db_grid_details,indent=4).replace('"','').replace('\\','').replace(',',''))
+
+wait_nios(lab_gm_ip,lab_username,lab_password)
+
+log('Checking config of lab GM ...')
+lab_gm_details = get_lab_gm_details(lab_gm_ip,lab_username,lab_password)
+log('Done',True)
+log('Lab GM details: \n')
+print(json.dumps(lab_gm_details,indent=4).replace('"','').replace('\\','').replace(',','') + '\n' )
+
+# Print the list of changes made to DB, so user is aware and can manually revert them if required
+log('List of changes made to the DB (source file not modified):\n')
+#print(json.dumps(db_modifications,indent=2).replace('"','').replace('\\','').replace(',',''))   # dont like the formatting
+for item in db_modifications:
+    print('\t',item,':',db_modifications[item])
+
+# Change network type of lab to match that of DB if possible
+if lab_gm_details['nios_ver'] != db_grid_details['nios_ver']: log('NIOS version of Lab and GM do not match, restore may fail')
+if lab_gm_details['nw_type'] != db_gm_details['nw_type']:
+    log('Network type of Lab and DB does not match')
+    lab_gm_ip_type, lab_gm_ip = lab_adjust_network(lab_gm_details,db_gm_details,lab_gm_ip,lab_username,lab_password)
+    wait_nios(lab_gm_ip,lab_username,lab_password)
+
+# Change hostname of lab GM to match that from DB
+if db_gm_details['hostname'] != lab_gm_details['hostname']:
+    log('Changing Lab GM hostname to match that of DB: ' + db_gm_details['hostname'] + ' ...')
+    c = lab_gm_change_name(lab_gm_ip,lab_username,lab_password,lab_gm_details['hostname'],db_gm_details['hostname'])
+    if c: lab_gm_details['hostname'] = db_gm_details['hostname']; log('Done',True)
+    else: log('Failed',True)
+    log('Waiting 30 seconds for GM to regenerate certificate ...')
+    time.sleep(30)
+    wait_nios(lab_gm_ip,lab_username,lab_password)
+
+log('Use "admin" account with password "123@BLOXlab" to login')
+log('Restoring DB to ' + lab_gm_ip + ' ...')
+restore_db(backup_file,lab_gm_ip,lab_username,lab_password)
+#log('Waiting 90 seconds for lab GM reboot ...')
+#time.sleep(90)
+#wait_nios(lab_gm_ip,'admin','123@BLOXlab')
+print('') # This is to move prompt to new line after exiting script

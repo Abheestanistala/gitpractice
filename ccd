@@ -1,0 +1,18 @@
+#!/bin/bash
+#function ccd() {
+
+#while getopts :c: opt; do
+#        case $opt in
+#                c)
+#                CASE=`echo $OPTARG | tr a-z A-Z | egrep -v '[A-Z]'`;
+#                ;;
+#	esac
+#done
+
+
+echo "$1";
+BASEDIR="/mnt/working/cases";
+TARGET="${BASEDIR}/C`echo $1`"; 
+echo ${TARGET};
+cd ${TARGET};
+
